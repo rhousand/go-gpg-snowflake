@@ -29,8 +29,15 @@ var app *App
 var logger zerolog.Logger
 
 func loadConfig() {
-	ctx := context.TODO()
-	awsCfg, _ := config.LoadDefaultConfig(ctx)
+	// SECURITY FIX: Add timeout for config loading
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// SECURITY FIX: Check AWS config loading error
+	awsCfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatal("Failed to load AWS config:", err)
+	}
 
 	client := secretsmanager.NewFromConfig(awsCfg)
 	secretName := os.Getenv("SECRETS_MANAGER_NAME")
@@ -59,7 +66,7 @@ func loadConfig() {
 		log.Fatal("Invalid secret JSON:", err)
 	}
 	if len(cfg.JWTSecret) < 32 {
-		log.Fatal("JWT_SECRET too short")
+		log.Fatal("JWT_SECRET must be at least 32 characters")
 	}
 }
 
@@ -82,9 +89,19 @@ func main() {
 		kms: NewKMS(),
 	}
 
+	// SECURITY FIX: Add request size limits middleware
+	maxBytesHandler := func(maxBytes int64, next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/encrypt", JWTAuth(http.HandlerFunc(app.EncryptHandler)))
-	mux.Handle("/import-key", JWTAuth(http.HandlerFunc(app.ImportKeyHandler)))
+	// 100MB limit for file encryption uploads
+	mux.Handle("/encrypt", maxBytesHandler(100*1024*1024, JWTAuth(http.HandlerFunc(app.EncryptHandler))))
+	// 1MB limit for PGP key imports
+	mux.Handle("/import-key", maxBytesHandler(1*1024*1024, JWTAuth(http.HandlerFunc(app.ImportKeyHandler))))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -94,6 +111,7 @@ func main() {
 		Handler:      mux,
 		ReadTimeout:  15 * time.Minute,
 		WriteTimeout: 15 * time.Minute,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	log.Println("Secure PGP Exchange API running on :8443")

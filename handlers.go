@@ -32,7 +32,13 @@ func (a *App) ImportKeyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	armored, _ := io.ReadAll(file)
+	// SECURITY FIX: Check io.ReadAll error and add size limit
+	armored, err := io.ReadAll(io.LimitReader(file, 1*1024*1024)) // 1MB limit
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to read public key")
+		http.Error(w, "failed to read key", http.StatusInternalServerError)
+		return
+	}
 	if _, err := openpgp.ReadArmoredKeyRing(strings.NewReader(string(armored))); err != nil {
 		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
@@ -46,9 +52,20 @@ func (a *App) ImportKeyHandler(w http.ResponseWriter, r *http.Request) {
 		KMSCMKID:         kmsID,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// SECURITY FIX: Don't expose internal error details
+		logger.Error().Err(err).Str("company_id", companyID).Msg("failed to upsert company")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// SECURITY: Log successful key import for audit trail
+	logger.Info().
+		Str("company_id", companyID).
+		Str("name", name).
+		Str("kms_cmk_id", kmsID).
+		Str("ip", r.RemoteAddr).
+		Msg("PGP key imported successfully")
+
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte("Key imported"))
 }
@@ -64,38 +81,62 @@ func (a *App) EncryptHandler(w http.ResponseWriter, r *http.Request) {
 
 	company, err := a.db.GetCompany(companyID)
 	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		// SECURITY FIX: Don't reveal company existence, use generic error
+		logger.Warn().Err(err).Str("company_id", companyID).Msg("company not found")
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 
 	recipients, err := openpgp.ReadArmoredKeyRing(strings.NewReader(company.PublicKeyArmored))
 	if err != nil {
-		http.Error(w, "bad key", http.StatusInternalServerError)
+		// SECURITY FIX: Don't expose internal details
+		logger.Error().Err(err).Str("company_id", companyID).Msg("failed to parse stored public key")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	ctx := r.Context()
 	dk, err := a.kms.GenerateDataKey(ctx, company.KMSCMKID)
 	if err != nil {
-		http.Error(w, "KMS error", http.StatusInternalServerError)
+		logger.Error().Err(err).Str("company_id", companyID).Str("kms_cmk_id", company.KMSCMKID).Msg("KMS GenerateDataKey failed")
+		http.Error(w, "encryption failed", http.StatusInternalServerError)
 		return
 	}
+	// SECURITY: Zero plaintext key from memory after use
+	defer func() {
+		for i := range dk.Plaintext {
+			dk.Plaintext[i] = 0
+		}
+	}()
 
-	version, _ := a.db.IncrementVersion(companyID)
+	version, err := a.db.IncrementVersion(companyID)
+	if err != nil {
+		logger.Error().Err(err).Str("company_id", companyID).Msg("failed to increment version")
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	eventID := uuid.New().String()
 
-	a.db.RecordEvent(&EncryptionEvent{
+	err = a.db.RecordEvent(&EncryptionEvent{
 		EventID:             eventID,
 		CompanyID:           companyID,
 		KMSCMKID:            company.KMSCMKID,
 		KeyVersion:          version,
 		EncryptedDataKeyB64: base64.StdEncoding.EncodeToString(dk.CiphertextBlob),
 	})
+	if err != nil {
+		logger.Error().Err(err).Str("event_id", eventID).Msg("CRITICAL: encryption succeeded but audit logging failed")
+		http.Error(w, "audit logging failed", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/pgp-encrypted")
 	w.Header().Set("Content-Disposition", `attachment; filename="encrypted.pgp"`)
 	w.Header().Set("X-Event-ID", eventID)
 	w.Header().Set("X-Key-Version", fmt.Sprintf("%d", version))
 
-	EncryptHybridStream(w, recipients, file, dk.Plaintext)
+	if err := EncryptHybridStream(w, recipients, file, dk.Plaintext); err != nil {
+		logger.Error().Err(err).Str("event_id", eventID).Msg("encryption failed")
+		// Note: Response headers already sent, can't send error to client
+	}
 }
