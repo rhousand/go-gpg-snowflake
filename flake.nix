@@ -10,20 +10,35 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+
+        # For Docker, always build for Linux
+        pkgsLinux = import nixpkgs { system = "x86_64-linux"; };
+
+        # Native build for current system
         app = pkgs.buildGoModule {
           pname = "gopgp-secure-exchange";
           version = "1.0.0";
           src = ./.;
-          vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # will be filled on first build
-          CGO_ENABLED = 0;
+          proxyVendor = true;
+          vendorHash = "sha256-P5OmmX+bv2TuRJ6vuNE56K0N09TgK4ENDiAU8YtRz/A";
+          ldflags = [ "-s" "-w" ];
+        };
+
+        # Linux build for container
+        appLinux = pkgsLinux.buildGoModule {
+          pname = "gopgp-secure-exchange";
+          version = "1.0.0";
+          src = ./.;
+          proxyVendor = true;
+          vendorHash = "sha256-P5OmmX+bv2TuRJ6vuNE56K0N09TgK4ENDiAU8YtRz/A";
           ldflags = [ "-s" "-w" ];
         };
       in {
-        packages.container = pkgs.dockerTools.buildLayeredImage {
+        packages.container = pkgsLinux.dockerTools.buildLayeredImage {
           name = "github.com/rhousand/go-gpg-snowflake";
           tag = "latest";
-          contents = [ app pkgs.cacert ];
-          config.Cmd = [ "${app}/bin/main" ];
+          contents = [ appLinux pkgsLinux.cacert ];
+          config.Cmd = [ "${appLinux}/bin/go-gpg-snowflake" ];
           config.ExposedPorts = { "8443/tcp" = {}; };
         };
 
