@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -125,6 +129,43 @@ func rateLimitMiddleware(rlMap *rateLimiterMap) func(http.Handler) http.Handler 
 	}
 }
 
+// PHASE 4 FIX (Issue 4.4): Request ID middleware for distributed tracing
+// Generates unique request ID and adds to context and response headers
+type contextKey string
+
+const requestIDKey contextKey = "request_id"
+
+func generateRequestID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID if random generation fails
+		return hex.EncodeToString([]byte(time.Now().String()))
+	}
+	return hex.EncodeToString(b)
+}
+
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check for existing request ID in headers (for tracing across services)
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = generateRequestID()
+		}
+
+		// Add request ID to response headers
+		w.Header().Set("X-Request-ID", requestID)
+
+		// Add request ID to context for use in handlers and logging
+		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+
+		// Add request ID to logger context for this request
+		reqLogger := logger.With().Str("request_id", requestID).Logger()
+		ctx = reqLogger.WithContext(ctx)
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.SetFlags(0)
@@ -169,11 +210,12 @@ func main() {
 	rateLimit := rateLimitMiddleware(rlMap)
 
 	mux := http.NewServeMux()
-	// 100MB limit for file encryption uploads with rate limiting
-	mux.Handle("/encrypt", securityHeadersMiddleware(rateLimit(maxBytesHandler(100*1024*1024, JWTAuth(http.HandlerFunc(app.EncryptHandler))))))
-	// 1MB limit for PGP key imports with rate limiting
-	mux.Handle("/import-key", securityHeadersMiddleware(rateLimit(maxBytesHandler(1*1024*1024, JWTAuth(http.HandlerFunc(app.ImportKeyHandler))))))
-	// PHASE 3 FIX (Issue 3.8): Harden /health endpoint
+	// PHASE 4: Middleware chain order: requestID → securityHeaders → rateLimit → maxBytes → JWT → handler
+	// 100MB limit for file encryption uploads with rate limiting and request tracing
+	mux.Handle("/encrypt", requestIDMiddleware(securityHeadersMiddleware(rateLimit(maxBytesHandler(100*1024*1024, JWTAuth(http.HandlerFunc(app.EncryptHandler)))))))
+	// 1MB limit for PGP key imports with rate limiting and request tracing
+	mux.Handle("/import-key", requestIDMiddleware(securityHeadersMiddleware(rateLimit(maxBytesHandler(1*1024*1024, JWTAuth(http.HandlerFunc(app.ImportKeyHandler)))))))
+	// PHASE 4 FIX (Issue 4.2): Health check with database connectivity test
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		// Apply security headers for consistency
 		w.Header().Set("Content-Type", "application/json")
@@ -181,9 +223,24 @@ func main() {
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
-		// Return basic status without sensitive information
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		// Test database connectivity with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		dbHealthy := true
+		if err := app.db.DB.PingContext(ctx); err != nil {
+			logger.Error().Err(err).Msg("health check: database ping failed")
+			dbHealthy = false
+		}
+
+		// Return health status
+		if dbHealthy {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok","database":"healthy"}`))
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"degraded","database":"unhealthy"}`))
+		}
 	})
 
 	// SECURITY FIX: Harden TLS configuration
@@ -205,6 +262,42 @@ func main() {
 		TLSConfig:    tlsConfig,
 	}
 
-	log.Println("Secure PGP Exchange API running on :8443 (TLS 1.3)")
-	log.Fatal(srv.ListenAndServeTLS("cert.pem", "key.pem"))
+	// PHASE 4 FIX (Issue 4.5): Graceful shutdown handling
+	// Start server in goroutine
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info().Str("addr", srv.Addr).Msg("starting HTTPS server with TLS 1.3")
+		serverErrors <- srv.ListenAndServeTLS("cert.pem", "key.pem")
+	}()
+
+	// Setup signal handling for graceful shutdown
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	// Block until a signal is received or server error occurs
+	select {
+	case err := <-serverErrors:
+		logger.Fatal().Err(err).Msg("server error")
+
+	case sig := <-shutdown:
+		logger.Info().Str("signal", sig.String()).Msg("shutdown signal received, starting graceful shutdown")
+
+		// Create context with timeout for shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Attempt graceful shutdown
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.Error().Err(err).Msg("graceful shutdown failed, forcing close")
+			// Force close connections if graceful shutdown times out
+			srv.Close()
+		}
+
+		// Close database connection
+		if err := app.db.Close(); err != nil {
+			logger.Error().Err(err).Msg("error closing database connection")
+		}
+
+		logger.Info().Msg("server shutdown complete")
+	}
 }
