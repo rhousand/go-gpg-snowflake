@@ -173,8 +173,17 @@ func main() {
 	mux.Handle("/encrypt", securityHeadersMiddleware(rateLimit(maxBytesHandler(100*1024*1024, JWTAuth(http.HandlerFunc(app.EncryptHandler))))))
 	// 1MB limit for PGP key imports with rate limiting
 	mux.Handle("/import-key", securityHeadersMiddleware(rateLimit(maxBytesHandler(1*1024*1024, JWTAuth(http.HandlerFunc(app.ImportKeyHandler))))))
+	// PHASE 3 FIX (Issue 3.8): Harden /health endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+		// Apply security headers for consistency
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// Return basic status without sensitive information
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	// SECURITY FIX: Harden TLS configuration
