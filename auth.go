@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"time"
+
 	"github.com/golang-jwt/jwt/v5"
 	"net/http"
 	"strings"
@@ -27,7 +29,12 @@ func JWTAuth(next http.Handler) http.Handler {
 		claims := jwt.MapClaims{}
 		token, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (interface{}, error) {
 			return []byte(cfg.JWTSecret), nil
-		}, jwt.WithValidMethods([]string{"HS256"}))
+		},
+			jwt.WithValidMethods([]string{"HS256"}),
+			jwt.WithExpirationRequired(),  // SECURITY FIX: Require expiration claim
+			jwt.WithIssuedAt(),            // SECURITY FIX: Validate issued-at time
+			jwt.WithLeeway(5*time.Second), // SECURITY FIX: 5-second clock skew tolerance
+		)
 
 		if err != nil || !token.Valid {
 			logger.Warn().

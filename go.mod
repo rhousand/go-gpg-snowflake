@@ -13,6 +13,7 @@ require (
 	github.com/rs/zerolog v1.33.0
 	github.com/snowflakedb/gosnowflake v1.11.1
 	golang.org/x/crypto v0.45.0
+	golang.org/x/time v0.14.0
 )
 
 require (
